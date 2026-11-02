@@ -264,6 +264,12 @@ def send_telegram(text):
         import requests
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                       data={"chat_id": chat, "text": text}, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            print("Telegram API error:", result)
+        else:
+            print("Telegram notification sent successfully!")
     except Exception as ex:
         print("Telegram failed:", ex)
 
