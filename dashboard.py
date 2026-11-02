@@ -441,6 +441,12 @@ def scan_every_strike(client, contracts, lookback_days, rr, pause_seconds=0.45):
                 if pd.Timestamp(event["time"]) == latest_time:
                     events.append({**event, "contract": symbol})
 
+            latest_buy = next(
+                (e for e in reversed(found)
+                 if pd.Timestamp(e["time"]) == latest_time
+                 and e.get("stage") == "CONFIRMED PAPER BUY SETUP"),
+                None
+            )
             rows.append({
                 "Contract": symbol,
                 "Strike": contract["strike"],
@@ -452,6 +458,7 @@ def scan_every_strike(client, contracts, lookback_days, rr, pause_seconds=0.45):
                 "Support": float(last["Support"]),
                 "Resistance": float(last["Resistance"]),
                 "Trend": "Bullish" if last["EMA9"] > last["EMA21"] else "Bearish",
+                "Target": float(latest_buy["target"]) if latest_buy else np.nan,
                 "Latest events": ", ".join(
                     e["stage"] for e in found
                     if pd.Timestamp(e["time"]) == latest_time
@@ -1092,11 +1099,85 @@ with tab_options:
             if monitor_context_saved == monitor_context:
                 results = monitor_results
                 if isinstance(results, pd.DataFrame) and not results.empty:
+                    display_results = results.sort_values("Latest events", ascending=False).copy()
+                    trend_help = "Bullish = EMA 9 is above EMA 21. Bearish = EMA 9 is below EMA 21."
+                    column_help = {
+                        "Contract": "Option name received from Angel One.",
+                        "Strike": "The option strike price.",
+                        "Side": "CE means Call option. PE means Put option.",
+                        "Last candle": "Time of the latest completed 5-minute candle.",
+                        "Close": "The option premium when that 5-minute candle closed.",
+                        "EMA9": "Average price that follows the recent 9 candles more closely.",
+                        "EMA21": "Average price based on the recent 21 candles.",
+                        "Support": "A recent lower price area where the option may find buying interest.",
+                        "Resistance": "A recent upper price area the option may struggle to cross.",
+                        "Trend": trend_help,
+                        "Target": "Estimated strategy target. It is shown only when a BUY setup is confirmed. It is not guaranteed to be reached.",
+                        "Latest events": "The strategy event found on the latest completed candle. None means no new event."
+                    }
+                    trend_style = display_results.style.applymap(
+                        lambda value: (
+                            "color: #16803c; font-weight: 700"
+                            if value == "Bullish" else
+                            "color: #dc2626; font-weight: 700"
+                            if value == "Bearish" else ""
+                        ),
+                        subset=["Trend"]
+                    )
+                    table_column_config = {
+                        col: st.column_config.Column(col, help=help_text)
+                        for col, help_text in column_help.items()
+                    }
+                    table_column_config["Target"] = st.column_config.NumberColumn(
+                        "Target (₹)", help=column_help["Target"], format="₹%.2f"
+                    )
                     st.dataframe(
-                        results.sort_values("Latest events", ascending=False),
+                        trend_style,
+                        column_config=table_column_config,
                         use_container_width=True,
                         hide_index=True
                     )
+
+                    st.markdown("#### Strategy chart")
+                    st.caption("Choose one option to see its 5-minute closing price, EMA 9, EMA 21, support and resistance.")
+                    chart_symbols = display_results["Contract"].dropna().astype(str).unique().tolist()
+                    chart_symbol = st.selectbox(
+                        "Option for chart",
+                        chart_symbols,
+                        key="monitor_strategy_chart_symbol"
+                    )
+                    if st.button("Load strategy chart", key="load_monitor_strategy_chart"):
+                        try:
+                            selected_contract = all_contracts[
+                                all_contracts["symbol"].astype(str) == chart_symbol
+                            ]
+                            if selected_contract.empty:
+                                st.warning("This option is not in the currently selected expiry.")
+                            else:
+                                chart_token = str(selected_contract.iloc[0]["token"])
+                                chart_end = datetime.now(pd.Timestamp.now(tz=TZ).tzinfo)
+                                chart_start = chart_end - timedelta(days=scan_lookback * 2 + 3)
+                                chart_raw = api.historical_candles(chart_token, chart_start, chart_end)
+                                if not chart_raw.empty:
+                                    chart_now = pd.Timestamp.now(tz=TZ)
+                                    chart_raw = chart_raw.loc[
+                                        chart_raw.index + pd.Timedelta(minutes=5) <= chart_now
+                                    ]
+                                chart_data, _ = analyze_option_candles(chart_raw, rr)
+                                st.session_state["monitor_strategy_chart_data"] = chart_data
+                                st.session_state["monitor_strategy_chart_symbol"] = chart_symbol
+                        except Exception as exc:
+                            st.error(f"Could not load strategy chart: {exc}")
+
+                    saved_chart = st.session_state.get("monitor_strategy_chart_data")
+                    saved_symbol = st.session_state.get("monitor_strategy_chart_symbol")
+                    if isinstance(saved_chart, pd.DataFrame) and not saved_chart.empty and saved_symbol == chart_symbol:
+                        st.line_chart(
+                            saved_chart[["Close", "EMA9", "EMA21", "Support", "Resistance"]].tail(120),
+                            height=360
+                        )
+                        st.caption("How to read: price above EMA 9 and EMA 21 is stronger; EMA 9 above EMA 21 means bullish trend. Support and resistance are calculated from recent candles. These are estimates, not guarantees.")
+
                     st.download_button(
                         "Download monitoring scan CSV",
                         results.to_csv(index=False),
