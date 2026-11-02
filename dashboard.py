@@ -667,7 +667,7 @@ def format_buy_alert(event, label):
         stamp = stamp.tz_convert(TZ)
 
     return (
-        f"STOCK TOOLS - BUY ALERT\n\n"
+        f"BUY ALERT\n\n"
         f"{label}\n"
         f"Time: {stamp.strftime('%Y-%m-%d %H:%M')} IST\n\n"
         f"Buy : ₹{float(event['price']):.2f}\n"
@@ -675,7 +675,7 @@ def format_buy_alert(event, label):
         f"Sell: ₹{float(event['target']):.2f}\n\n"
         f"Why buying: EMA Retest Breakout\n\n"
         f"5-minute strategy\n"
-        f"Paper alert only. No broker order placed."
+        f"No broker order placed."
     )
 
 
@@ -1115,13 +1115,15 @@ with tab_options:
                         "Target": "Estimated strategy target. It is shown only when a BUY setup is confirmed. It is not guaranteed to be reached.",
                         "Latest events": "The strategy event found on the latest completed candle. None means no new event."
                     }
-                    trend_style = display_results.style.applymap(
-                        lambda value: (
-                            "color: #16803c; font-weight: 700"
-                            if value == "Bullish" else
-                            "color: #dc2626; font-weight: 700"
-                            if value == "Bearish" else ""
-                        ),
+                    trend_colors = lambda value: (
+                        "color: #16803c; font-weight: 700"
+                        if value == "Bullish" else
+                        "color: #dc2626; font-weight: 700"
+                        if value == "Bearish" else ""
+                    )
+
+                    trend_style = display_results.style.map(
+                        trend_colors,
                         subset=["Trend"]
                     )
                     table_column_config = {
