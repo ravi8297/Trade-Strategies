@@ -27,6 +27,7 @@ import socket
 import calendar
 import time
 import threading
+import sqlite3
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -615,6 +616,42 @@ def send_telegram_alert(message: str) -> tuple[bool,str]:
     except Exception as exc:
         return False,f"Telegram send failed: {exc}"
 
+def _alert_db_path():
+    # Stored beside dashboard.py. Keep this file private and out of Git.
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_tools_alerts.sqlite3")
+
+
+def claim_alert_once(key):
+    """Atomically reserve an alert key across reruns and multiple app sessions."""
+    try:
+        with sqlite3.connect(_alert_db_path(), timeout=10) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sent_alerts (alert_key TEXT PRIMARY KEY, sent_at TEXT NOT NULL)"
+            )
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO sent_alerts(alert_key, sent_at) VALUES (?, ?)",
+                (key, datetime.now().isoformat(timespec="seconds")),
+            )
+            return cursor.rowcount == 1
+    except sqlite3.Error:
+        # Do not send if deduplication storage is unavailable: duplicates are worse.
+        return False
+
+
+def release_alert_claim(key):
+    """Allow retry when Telegram rejects or cannot receive an alert."""
+    try:
+        with sqlite3.connect(_alert_db_path(), timeout=10) as conn:
+            conn.execute("DELETE FROM sent_alerts WHERE alert_key = ?", (key,))
+    except sqlite3.Error:
+        pass
+
+
+def alert_key_for(event, label):
+    stamp = pd.Timestamp(event["time"])
+    return f"{label}|{event['stage']}|{stamp.isoformat()}"
+
+
 def format_buy_alert(event, label):
     stamp = pd.Timestamp(event["time"])
     if stamp.tzinfo is None:
@@ -623,14 +660,14 @@ def format_buy_alert(event, label):
         stamp = stamp.tz_convert(TZ)
 
     return (
-        f"STOCK TOOLS - BUY ALERT\\n\\n"
-        f"{label}\\n"
-        f"Time: {stamp.strftime('%Y-%m-%d %H:%M')} IST\\n\\n"
-        f"Buy : ₹{float(event['price']):.2f}\\n"
-        f"SL  : ₹{float(event['stop']):.2f}\\n"
-        f"Sell: ₹{float(event['target']):.2f}\\n\\n"
-        f"Why buying: EMA Retest Breakout\\n\\n"
-        f"5-minute strategy\\n"
+        f"STOCK TOOLS - BUY ALERT\n\n"
+        f"{label}\n"
+        f"Time: {stamp.strftime('%Y-%m-%d %H:%M')} IST\n\n"
+        f"Buy : ₹{float(event['price']):.2f}\n"
+        f"SL  : ₹{float(event['stop']):.2f}\n"
+        f"Sell: ₹{float(event['target']):.2f}\n\n"
+        f"Why buying: EMA Retest Breakout\n\n"
+        f"5-minute strategy\n"
         f"Paper alert only. No broker order placed."
     )
 
@@ -644,8 +681,8 @@ def dispatch_new_alerts(events: list, label: str):
         if event.get("stage") != "CONFIRMED PAPER BUY SETUP":
             continue
 
-        key = f"{label}|{event['stage']}|{event['time']}"
-        if key in st.session_state.sent_alert_keys:
+        key = alert_key_for(event, label)
+        if not claim_alert_once(key):
             continue
 
         ok, detail = send_telegram_alert(format_buy_alert(event, label))
@@ -653,35 +690,48 @@ def dispatch_new_alerts(events: list, label: str):
             st.session_state.sent_alert_keys.add(key)
             sent_count += 1
         else:
+            release_alert_claim(key)
             st.warning(f"{label}: {detail}")
 
     return sent_count
 
 
-# One process-wide monitor is used so a Streamlit rerun does not start another worker.
-_MONITOR_LOCK = threading.Lock()
-_MONITOR_STATE = {
-    "running": False,
-    "stop_event": None,
-    "thread": None,
-    "status": "Stopped",
-    "last_scan": None,
-    "last_scan_duration": None,
-    "last_results": pd.DataFrame(),
-    "last_events": [],
-    "last_errors": pd.DataFrame(),
-    "last_alert_count": 0,
-    "context": None,
-    "sent_keys": set(),
-}
+# Keep monitor state alive across Streamlit script reruns.
+@st.cache_resource
+def get_monitor_manager():
+    return {
+        "lock": threading.Lock(),
+        "state": {
+            "running": False,
+            "stop_event": None,
+            "thread": None,
+            "status": "Stopped",
+            "last_scan": None,
+            "last_scan_duration": None,
+            "last_results": pd.DataFrame(),
+            "last_events": [],
+            "last_errors": pd.DataFrame(),
+            "last_alert_count": 0,
+            "context": None,
+            "sent_keys": set(),
+        },
+    }
+
+
+def monitor_lock():
+    return get_monitor_manager()["lock"]
+
+
+def monitor_state():
+    return get_monitor_manager()["state"]
 
 
 def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
     while not stop_event.is_set():
         scan_started = time.time()
         try:
-            with _MONITOR_LOCK:
-                _MONITOR_STATE["status"] = "Scanning all selected contracts..."
+            with monitor_lock():
+                monitor_state()["status"] = "Scanning all selected contracts..."
 
             results, events, errors = scan_every_strike(
                 client, contracts, lookback_days, rr
@@ -693,27 +743,25 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
             ]
             sent_count = 0
             for event in confirmed:
-                key = f"{event['contract']}|{event['stage']}|{event['time']}"
-                with _MONITOR_LOCK:
-                    already_sent = key in _MONITOR_STATE["sent_keys"]
-
-                if already_sent:
+                key = alert_key_for(event, event["contract"])
+                if not claim_alert_once(key):
                     continue
 
                 ok, detail = send_telegram_alert(
                     format_buy_alert(event, event["contract"])
                 )
                 if ok:
-                    with _MONITOR_LOCK:
-                        _MONITOR_STATE["sent_keys"].add(key)
+                    with monitor_lock():
+                        monitor_state()["sent_keys"].add(key)
                     sent_count += 1
                 else:
-                    with _MONITOR_LOCK:
-                        _MONITOR_STATE["status"] = f"Telegram error: {detail}"
+                    release_alert_claim(key)
+                    with monitor_lock():
+                        monitor_state()["status"] = f"Telegram error: {detail}"
 
             duration = round(time.time() - scan_started, 1)
-            with _MONITOR_LOCK:
-                _MONITOR_STATE.update({
+            with monitor_lock():
+                monitor_state().update({
                     "last_scan": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "last_scan_duration": duration,
                     "last_results": results,
@@ -733,8 +781,8 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
                 300 - ((now.minute % 5) * 60 + now.second)
             ) % 300
             wait_seconds = max(5, seconds_to_boundary + 3)
-            with _MONITOR_LOCK:
-                _MONITOR_STATE["status"] = (
+            with monitor_lock():
+                monitor_state()["status"] = (
                     f"Monitoring active. Next scan after the next completed "
                     f"5-minute candle (about {int(wait_seconds)} seconds)."
                 )
@@ -742,19 +790,19 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
                 break
 
         except Exception as exc:
-            with _MONITOR_LOCK:
-                _MONITOR_STATE["status"] = f"Scan error: {exc}. Retrying in 30 seconds."
+            with monitor_lock():
+                monitor_state()["status"] = f"Scan error: {exc}. Retrying in 30 seconds."
             if stop_event.wait(30):
                 break
 
-    with _MONITOR_LOCK:
-        _MONITOR_STATE["running"] = False
-        _MONITOR_STATE["status"] = "Stopped"
+    with monitor_lock():
+        monitor_state()["running"] = False
+        monitor_state()["status"] = "Stopped"
 
 
 def start_background_monitor(client, contracts, lookback_days, rr, context):
-    with _MONITOR_LOCK:
-        if _MONITOR_STATE["running"]:
+    with monitor_lock():
+        if monitor_state()["running"]:
             return False
 
         stop_event = threading.Event()
@@ -764,7 +812,7 @@ def start_background_monitor(client, contracts, lookback_days, rr, context):
             daemon=True,
             name="StockToolsOptionMonitor",
         )
-        _MONITOR_STATE.update({
+        monitor_state().update({
             "running": True,
             "stop_event": stop_event,
             "thread": worker,
@@ -777,11 +825,11 @@ def start_background_monitor(client, contracts, lookback_days, rr, context):
 
 
 def stop_background_monitor():
-    with _MONITOR_LOCK:
-        stop_event = _MONITOR_STATE.get("stop_event")
+    with monitor_lock():
+        stop_event = monitor_state().get("stop_event")
         if stop_event is not None:
             stop_event.set()
-        _MONITOR_STATE["status"] = "Stopping after the current API request..."
+        monitor_state()["status"] = "Stopping after the current API request..."
 
 
 # ============================= PAPER TRADING =============================
@@ -1017,16 +1065,16 @@ with tab_options:
                     stop_background_monitor()
                     st.info("Stop requested. The current scan will finish its current request, then stop.")
 
-            with _MONITOR_LOCK:
-                monitor_running = _MONITOR_STATE["running"]
-                monitor_status = _MONITOR_STATE["status"]
-                monitor_last_scan = _MONITOR_STATE["last_scan"]
-                monitor_duration = _MONITOR_STATE["last_scan_duration"]
-                monitor_results = _MONITOR_STATE["last_results"].copy()
-                monitor_events = list(_MONITOR_STATE["last_events"])
-                monitor_errors = _MONITOR_STATE["last_errors"].copy()
-                monitor_context_saved = _MONITOR_STATE["context"]
-                monitor_alert_count = _MONITOR_STATE["last_alert_count"]
+            with monitor_lock():
+                monitor_running = monitor_state()["running"]
+                monitor_status = monitor_state()["status"]
+                monitor_last_scan = monitor_state()["last_scan"]
+                monitor_duration = monitor_state()["last_scan_duration"]
+                monitor_results = monitor_state()["last_results"].copy()
+                monitor_events = list(monitor_state()["last_events"])
+                monitor_errors = monitor_state()["last_errors"].copy()
+                monitor_context_saved = monitor_state()["context"]
+                monitor_alert_count = monitor_state()["last_alert_count"]
 
             if monitor_running and st_autorefresh is not None:
                 st_autorefresh(interval=5000, key="stock_tools_monitor_refresh")

@@ -1,3 +1,4 @@
 .env
 venv/
 trades.csv
+stock_tools_alerts.sqlite3
