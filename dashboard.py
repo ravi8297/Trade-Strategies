@@ -609,19 +609,97 @@ def analyze_option_candles(raw: pd.DataFrame, rr: float = 2.0):
             state["entry_sent"]=True
     return df, events
 
-def send_telegram_alert(message: str) -> tuple[bool,str]:
-    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-    chat_id=os.getenv("TELEGRAM_CHAT_ID","").strip()
-    if not token or not chat_id:
-        return False,"Telegram is not configured in .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)."
+def send_telegram_alert(message: str, chat_id: Optional[str] = None) -> tuple[bool, str]:
+    """Send a Telegram message to an explicit destination; never expose the bot token."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    destination = (chat_id or os.getenv("TELEGRAM_ENTRY_CHAT_ID", "")).strip()
+    if not token or not destination:
+        return False, "Telegram is not configured. Check TELEGRAM_BOT_TOKEN and the relevant chat ID in .env."
     try:
-        response=requests.post(f"https://api.telegram.org/bot{token}/sendMessage",data={"chat_id":chat_id,"text":message},timeout=15)
-        payload=response.json()
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": destination, "text": message},
+            timeout=15,
+        )
+        payload = response.json()
         if response.ok and payload.get("ok"):
-            return True,"Telegram alert sent."
-        return False,f"Telegram API rejected the message: {payload.get('description','unknown error')}"
+            return True, "Telegram alert sent."
+        return False, f"Telegram API rejected the message: {payload.get('description', 'unknown error')}"
     except Exception as exc:
-        return False,f"Telegram send failed: {exc}"
+        return False, f"Telegram send failed: {exc}"
+
+
+def send_retest_telegram(message: str, message_id: Optional[int] = None):
+    """Send the first retest alert, then edit that same Telegram message as H/L changes."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_RETEST_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return False, "Set TELEGRAM_BOT_TOKEN and TELEGRAM_RETEST_CHAT_ID in .env.", None
+    try:
+        method = "editMessageText" if message_id else "sendMessage"
+        data = {"chat_id": chat_id, "text": message}
+        if message_id:
+            data["message_id"] = message_id
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data=data, timeout=15
+        )
+        payload = response.json()
+        if response.ok and payload.get("ok"):
+            result = payload.get("result") or {}
+            return True, "Retest Telegram message updated.", result.get("message_id", message_id)
+        description = payload.get("description", "unknown error")
+        # Telegram may reject an unchanged edit; that is not a delivery failure.
+        if message_id and "message is not modified" in str(description).lower():
+            return True, "Retest Telegram message unchanged.", message_id
+        return False, f"Telegram retest message failed: {description}", message_id
+    except Exception as exc:
+        return False, f"Telegram retest message failed: {exc}", message_id
+
+
+def send_entry_telegram(message: str) -> tuple[bool, str]:
+    # Backward-compatible fallback to TELEGRAM_CHAT_ID for existing setups.
+    return send_telegram_alert(
+        message,
+        os.getenv("TELEGRAM_ENTRY_CHAT_ID", "") or os.getenv("TELEGRAM_CHAT_ID", ""),
+    )
+
+
+def format_retest_alert(contract: str, ltp: float, ema9: float, ema21: float,
+                        candle_high: float, candle_low: float, candle_time) -> str:
+    stamp = pd.Timestamp(candle_time)
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize(TZ)
+    else:
+        stamp = stamp.tz_convert(TZ)
+    return (
+        "STOCK TOOLS - RETEST ALERT\n\n"
+        f"{contract}\n"
+        f"Retest candle is forming ({stamp:%H:%M}–{(stamp + pd.Timedelta(minutes=5)):%H:%M} IST)\n\n"
+        f"Current price : ₹{ltp:.2f}\n"
+        f"EMA 9         : ₹{ema9:.2f}\n"
+        f"EMA 21        : ₹{ema21:.2f}\n"
+        f"Current candle High: ₹{candle_high:.2f}\n"
+        f"Current candle Low : ₹{candle_low:.2f}\n\n"
+        f"Wait for this 5-minute candle to close. Watch breakout above its FINAL High.\n"
+        "NOT A BUY SIGNAL. If price breaks EMA 21 before candle close, this retest is cancelled."
+    )
+
+
+def format_entry_alert(contract: str, entry: float, stop: float, target: float,
+                       rr: float, live_price: float) -> str:
+    return (
+        "STOCK TOOLS - ENTRY ALERT\n\n"
+        f"{contract}\n\n"
+        f"Price broke above retest candle High: ₹{entry:.2f}\n"
+        f"Current live price: ₹{live_price:.2f}\n\n"
+        f"BUY       : ₹{entry:.2f} (breakout reference)\n"
+        f"STOP-LOSS : ₹{stop:.2f} (Retest candle Low)\n"
+        f"TARGET    : ₹{target:.2f} (1:{rr:g} Risk-Reward)\n\n"
+        "Potential entry opportunity. Check live price/slippage and review chart before entering.\n"
+        "Paper alert only. No broker order placed."
+    )
+
 
 def _alert_db_path():
     # Stored beside dashboard.py. Keep this file private and out of Git.
@@ -692,7 +770,7 @@ def dispatch_new_alerts(events: list, label: str):
         if not claim_alert_once(key):
             continue
 
-        ok, detail = send_telegram_alert(format_buy_alert(event, label))
+        ok, detail = send_entry_telegram(format_buy_alert(event, label))
         if ok:
             st.session_state.sent_alert_keys.add(key)
             sent_count += 1
@@ -719,6 +797,9 @@ def get_monitor_manager():
             "last_events": [],
             "last_errors": pd.DataFrame(),
             "last_alert_count": 0,
+            "last_retest_count": 0,
+            "live_candidates": pd.DataFrame(),
+            "live_chart_data": {},
             "context": None,
             "sent_keys": set(),
         },
@@ -734,78 +815,321 @@ def monitor_state():
 
 
 def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
-    while not stop_event.is_set():
-        scan_started = time.time()
+    """
+    Bootstrap completed candles once, then poll Angel One FULL quotes in batches.
+    Retest alerts are intrabar; entry alerts are sent only after the retest candle
+    has closed and a later live quote trades above its frozen high.
+    """
+    baselines = {}
+    errors = []
+    total = len(contracts)
+    with monitor_lock():
+        monitor_state()["status"] = f"Loading candle history for {total} contracts..."
+
+    end_dt = datetime.now(pd.Timestamp.now(tz=TZ).tzinfo)
+    start_dt = end_dt - timedelta(days=lookback_days * 2 + 3)
+    now = pd.Timestamp.now(tz=TZ)
+
+    # One historical request per contract at startup. This is deliberately
+    # throttled; the quote polling phase uses 50-token batches.
+    for pos, (_, contract) in enumerate(contracts.iterrows(), 1):
+        if stop_event.is_set():
+            break
+        symbol = str(contract["symbol"])
+        token = str(contract["token"])
         try:
-            with monitor_lock():
-                monitor_state()["status"] = "Scanning all selected contracts..."
+            raw = client.historical_candles(token, start_dt, end_dt)
+            if not raw.empty:
+                raw = raw.loc[raw.index + pd.Timedelta(minutes=5) <= now]
+            if len(raw) < 25:
+                raise ValueError(f"Only {len(raw)} completed candles; need 25")
+            enriched, _ = analyze_option_candles(raw, rr)
+            last = enriched.iloc[-1]
+            baselines[token] = {
+                "symbol": symbol,
+                "strike": float(contract.get("strike", np.nan)),
+                "side": "CE" if symbol.endswith("CE") else "PE",
+                "ema9": float(last["EMA9"]),
+                "ema21": float(last["EMA21"]),
+                "resistance": float(last["Resistance"]) if pd.notna(last["Resistance"]) else np.nan,
+                "last_close": float(last["Close"]),
+                "last_candle_time": pd.Timestamp(enriched.index[-1]),
+                "state": "WAITING_FOR_RETEST",
+                "retest_time": None,
+                "retest_high": None,
+                "retest_low": None,
+                "retest_message_id": None,
+                "retest_closed": False,
+                "entry_sent": False,
+                "last_ltp": None,
+                "live_candle_time": None,
+                "live_high": None,
+                "live_low": None,
+                "history": enriched[["Close", "EMA9", "EMA21"]].tail(40).copy(),
+                "candles": raw[["Open", "High", "Low", "Close", "Volume"]].tail(120).copy(),
+                "live_open": None,
+            }
+        except Exception as exc:
+            errors.append({"Contract": symbol, "Error": str(exc)})
+        if pos < total:
+            time.sleep(0.45)
 
-            results, events, errors = scan_every_strike(
-                client, contracts, lookback_days, rr
-            )
+    if stop_event.is_set():
+        with monitor_lock():
+            monitor_state()["running"] = False
+            monitor_state()["status"] = "Stopped"
+        return
 
-            confirmed = [
-                event for event in events
-                if event.get("stage") == "CONFIRMED PAPER BUY SETUP"
-            ]
-            sent_count = 0
-            for event in confirmed:
-                key = alert_key_for(event, event["contract"])
-                if not claim_alert_once(key):
+    active_contracts = contracts[contracts["token"].astype(str).isin(baselines)].copy()
+    tokens = active_contracts["token"].astype(str).tolist()
+    token_to_contract = {
+        str(row["token"]): row for _, row in active_contracts.iterrows()
+    }
+    with monitor_lock():
+        monitor_state()["last_errors"] = pd.DataFrame(errors)
+        monitor_state()["status"] = (
+            f"Live quote monitoring: {len(tokens)}/{total} contracts loaded. "
+            "Polling Angel One FULL quotes in batches."
+        )
+
+    poll_seconds = max(5, int(os.getenv("STOCKTOOLS_POLL_SECONDS", "10")))
+    while not stop_event.is_set() and tokens:
+        cycle_started = time.time()
+        retest_alerts = 0
+        entry_alerts = 0
+        quote_errors = []
+        try:
+            quotes = client.full_quotes(tokens)
+            if quotes.empty:
+                raise RuntimeError("Angel One returned no live quotes.")
+            quotes = quotes.rename(columns={"symbolToken": "token"})
+            quotes["token"] = quotes["token"].astype(str)
+            quotes["ltp"] = pd.to_numeric(quotes["ltp"], errors="coerce")
+            quote_map = {
+                str(row["token"]): float(row["ltp"])
+                for _, row in quotes.iterrows()
+                if pd.notna(row.get("ltp")) and float(row["ltp"]) > 0
+            }
+            now_ts = pd.Timestamp.now(tz=TZ)
+            candle_start = now_ts.floor("5min")
+
+            for token, state in baselines.items():
+                ltp = quote_map.get(token)
+                if ltp is None:
                     continue
 
-                ok, detail = send_telegram_alert(
-                    format_buy_alert(event, event["contract"])
-                )
-                if ok:
-                    with monitor_lock():
-                        monitor_state()["sent_keys"].add(key)
-                    sent_count += 1
-                else:
-                    release_alert_claim(key)
-                    with monitor_lock():
-                        monitor_state()["status"] = f"Telegram error: {detail}"
+                # Keep a compact live price series for charts.
+                hist = state["history"]
+                hist.loc[now_ts] = [ltp, state["ema9"], state["ema21"]]
+                state["history"] = hist.tail(80)
 
-            duration = round(time.time() - scan_started, 1)
+                # Start/update the currently forming 5-minute option candle.
+                if state["live_candle_time"] != candle_start:
+                    previous_candle_time = state["live_candle_time"]
+                    # Finalize the candle that just ended and refresh indicators.
+                    if previous_candle_time is not None and state["live_open"] is not None:
+                        completed = pd.DataFrame(
+                            [{
+                                "Open": float(state["live_open"]),
+                                "High": float(state["live_high"]),
+                                "Low": float(state["live_low"]),
+                                "Close": float(state["last_ltp"] if state["last_ltp"] is not None else ltp),
+                                "Volume": 0.0,
+                            }],
+                            index=[previous_candle_time],
+                        )
+                        state["candles"] = pd.concat([state["candles"], completed]).tail(160)
+                        cdf = state["candles"].copy()
+                        cdf["EMA9"] = cdf["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+                        cdf["EMA21"] = cdf["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+                        cdf["Resistance"] = cdf["High"].rolling(20, min_periods=5).max().shift(1)
+                        state["ema9"] = float(cdf["EMA9"].iloc[-1])
+                        state["ema21"] = float(cdf["EMA21"].iloc[-1])
+                        state["resistance"] = (
+                            float(cdf["Resistance"].iloc[-1])
+                            if pd.notna(cdf["Resistance"].iloc[-1]) else np.nan
+                        )
+                        state["history"] = cdf[["Close", "EMA9", "EMA21"]].tail(80)
+                    # Freeze the previous retest candle at its actual boundary.
+                    if state["retest_time"] is not None and not state["retest_closed"]:
+                        if candle_start > state["retest_time"]:
+                            state["retest_closed"] = True
+                    state["live_candle_time"] = candle_start
+                    state["live_open"] = ltp
+                    state["live_high"] = ltp
+                    state["live_low"] = ltp
+                else:
+                    state["live_high"] = max(float(state["live_high"]), ltp)
+                    state["live_low"] = min(float(state["live_low"]), ltp)
+
+                # If a retest is already active, update its live candle extremes.
+                if state["state"] == "RETEST_FORMING" and state["live_candle_time"] == state["retest_time"]:
+                    state["retest_high"] = max(float(state["retest_high"]), ltp)
+                    state["retest_low"] = min(float(state["retest_low"]), ltp)
+
+                ema9, ema21 = state["ema9"], state["ema21"]
+                if ema9 <= ema21:
+                    if state["state"] in ("RETEST_FORMING", "WAITING_FOR_BREAKOUT"):
+                        state["state"] = "CANCELLED_EMA21_BREAK"
+                    continue
+
+                # Intrabar retest: price trades down to EMA9 (within one 0.05 tick)
+                # while remaining above EMA21. The alert is one per 5-minute candle.
+                if state["state"] == "WAITING_FOR_RETEST":
+                    if ltp <= ema9 + 0.05 and ltp > ema21:
+                        state.update({
+                            "state": "RETEST_FORMING",
+                            "retest_time": candle_start,
+                            "retest_high": float(state["live_high"]),
+                            "retest_low": float(state["live_low"]),
+                            "retest_closed": False,
+                            "entry_sent": False,
+                        })
+                        key = f"RETEST|{token}|{candle_start.isoformat()}"
+                        if claim_alert_once(key):
+                            msg = format_retest_alert(
+                                state["symbol"], ltp, ema9, ema21,
+                                state["retest_high"], state["retest_low"], candle_start
+                            )
+                            ok, detail, message_id = send_retest_telegram(msg)
+                            if ok:
+                                state["retest_message_id"] = message_id
+                                retest_alerts += 1
+                            else:
+                                release_alert_claim(key)
+                                quote_errors.append({"Contract": state["symbol"], "Error": detail})
+
+                elif state["state"] == "RETEST_FORMING":
+                    # Fail the retest immediately if EMA21 is lost before candle close.
+                    if ltp <= ema21:
+                        state["state"] = "CANCELLED_EMA21_BREAK"
+                        cancel_text = (
+                            f"STOCK TOOLS - RETEST CANCELLED\n\n{state['symbol']}\n"
+                            f"Price fell to/below EMA 21 (₹{ema21:.2f}) before candle close.\n"
+                            "No entry alert will be generated for this retest."
+                        )
+                        if state.get("retest_message_id"):
+                            send_retest_telegram(cancel_text, state["retest_message_id"])
+                    elif state.get("retest_message_id"):
+                        update_text = format_retest_alert(
+                            state["symbol"], ltp, ema9, ema21,
+                            float(state["retest_high"]), float(state["retest_low"]),
+                            state["retest_time"]
+                        )
+                        ok, detail, updated_id = send_retest_telegram(
+                            update_text, state["retest_message_id"]
+                        )
+                        if ok:
+                            state["retest_message_id"] = updated_id
+                        else:
+                            quote_errors.append({"Contract": state["symbol"], "Error": detail})
+
+                elif state["state"] == "WAITING_FOR_BREAKOUT":
+                    # Only a subsequent candle may trigger the entry.
+                    if state["retest_closed"] and ltp > float(state["retest_high"]) and not state["entry_sent"]:
+                        entry = float(state["retest_high"])
+                        stop = float(state["retest_low"])
+                        risk = entry - stop
+                        target = entry + rr * risk
+                        resistance = state.get("resistance", np.nan)
+                        # Avoid issuing a target that sits beyond the recent option resistance.
+                        if risk <= 0 or (pd.notna(resistance) and resistance >= entry and target > resistance):
+                            state["state"] = "SKIPPED_TARGET_ROOM"
+                            continue
+                        key = f"ENTRY|{token}|{pd.Timestamp(state['retest_time']).isoformat()}"
+                        if claim_alert_once(key):
+                            msg = format_entry_alert(
+                                state["symbol"], entry, stop, target, rr, ltp
+                            )
+                            ok, detail = send_entry_telegram(msg)
+                            if ok:
+                                state["entry_sent"] = True
+                                state["state"] = "ENTRY_ALERT_SENT"
+                                entry_alerts += 1
+                            else:
+                                release_alert_claim(key)
+                                quote_errors.append({"Contract": state["symbol"], "Error": detail})
+
+                # At the first quote after the retest candle boundary, freeze H/L.
+                if (state["state"] == "RETEST_FORMING"
+                        and state["retest_time"] is not None
+                        and candle_start > state["retest_time"]):
+                    state["retest_closed"] = True
+                    state["state"] = "WAITING_FOR_BREAKOUT"
+                    if state.get("retest_message_id"):
+                        closed_text = (
+                            "STOCK TOOLS - RETEST CANDLE CLOSED\n\n"
+                            f"{state['symbol']}\n"
+                            f"Final retest candle High: ₹{float(state['retest_high']):.2f}\n"
+                            f"Final retest candle Low : ₹{float(state['retest_low']):.2f}\n\n"
+                            f"Watch breakout above ₹{float(state['retest_high']):.2f}.\n"
+                            "Entry alert will be sent only if a later live quote breaks this High.\n"
+                            "This is not a buy signal yet."
+                        )
+                        ok, detail, updated_id = send_retest_telegram(
+                            closed_text, state["retest_message_id"]
+                        )
+                        if ok:
+                            state["retest_message_id"] = updated_id
+                        else:
+                            quote_errors.append({"Contract": state["symbol"], "Error": detail})
+
+                state["last_ltp"] = ltp
+
+            # Reset failed/used setup only on a fresh EMA regime after a new completed
+            # candle refresh; do not repeatedly alert the same retest candle.
+            duration = round(time.time() - cycle_started, 2)
+            live_rows = []
+            chart_data = {}
+            for token, state in baselines.items():
+                if state["state"] in ("RETEST_FORMING", "WAITING_FOR_BREAKOUT",
+                                      "CANCELLED_EMA21_BREAK", "SKIPPED_TARGET_ROOM",
+                                      "ENTRY_ALERT_SENT"):
+                    live_rows.append({
+                        "Contract": state["symbol"],
+                        "State": state["state"],
+                        "Live LTP": state["last_ltp"],
+                        "EMA 9": state["ema9"],
+                        "EMA 21": state["ema21"],
+                        "Retest candle": state["retest_time"],
+                        "Retest High": state["retest_high"],
+                        "Retest Low": state["retest_low"],
+                        "Retest closed": state["retest_closed"],
+                        "Resistance": state["resistance"],
+                    })
+                    chart_data[state["symbol"]] = state["history"].copy()
+
             with monitor_lock():
                 monitor_state().update({
                     "last_scan": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "last_scan_duration": duration,
-                    "last_results": results,
-                    "last_events": confirmed,
-                    "last_errors": errors,
-                    "last_alert_count": sent_count,
+                    "live_candidates": pd.DataFrame(live_rows),
+                    "live_chart_data": chart_data,
+                    "last_alert_count": entry_alerts,
+                    "last_retest_count": retest_alerts,
                     "context": context,
                     "status": (
-                        f"Scan complete: {len(results)}/{len(contracts)} contracts; "
-                        f"{len(errors)} failures; {sent_count} new BUY alerts."
+                        f"Live polling active | {len(quote_map)}/{len(tokens)} quotes | "
+                        f"{retest_alerts} retest alert(s), {entry_alerts} entry alert(s) "
+                        f"this cycle | {duration}s"
                     ),
                 })
-
-            # Wait for the next 5-minute candle boundary plus a small buffer.
-            now = pd.Timestamp.now(tz=TZ)
-            seconds_to_boundary = (
-                300 - ((now.minute % 5) * 60 + now.second)
-            ) % 300
-            wait_seconds = max(5, seconds_to_boundary + 3)
-            with monitor_lock():
-                monitor_state()["status"] = (
-                    f"Monitoring active. Next scan after the next completed "
-                    f"5-minute candle (about {int(wait_seconds)} seconds)."
-                )
-            if stop_event.wait(wait_seconds):
-                break
+                if quote_errors:
+                    old = monitor_state()["last_errors"]
+                    monitor_state()["last_errors"] = pd.concat(
+                        [old, pd.DataFrame(quote_errors)], ignore_index=True
+                    ).tail(200)
 
         except Exception as exc:
             with monitor_lock():
-                monitor_state()["status"] = f"Scan error: {exc}. Retrying in 30 seconds."
-            if stop_event.wait(30):
-                break
+                monitor_state()["status"] = (
+                    f"Live quote error: {exc}. Retrying in {poll_seconds} seconds."
+                )
+        stop_event.wait(max(1, poll_seconds - (time.time() - cycle_started)))
 
     with monitor_lock():
         monitor_state()["running"] = False
         monitor_state()["status"] = "Stopped"
-
 
 def start_background_monitor(client, contracts, lookback_days, rr, context):
     with monitor_lock():
@@ -898,7 +1222,7 @@ with st.sidebar:
                                    value=1.0, step=0.1)
     risk_budget = capital * risk_percent / 100
     st.metric("Maximum risk budget", money(risk_budget))
-    rr = st.selectbox("Index strategy reward/risk", [1.5, 2.0, 2.5, 3.0], index=1)
+    rr = st.selectbox("Strategy reward/risk", [1.0, 2.0, 3.0], index=1)
     period = st.selectbox("Index history", ["5d", "30d", "60d"], index=2)
     delta_min = st.slider("Minimum option Delta", 0.10, 0.90, 0.45, 0.05)
     delta_max = st.slider("Maximum option Delta", 0.10, 0.95, 0.75, 0.05)
@@ -1040,7 +1364,7 @@ with tab_options:
                 format_func=lambda d: d.strftime("%d %b %Y")
             )
             st.markdown("#### Scan ALL listed option strikes (independent of selection)")
-            st.caption("Start Monitoring runs repeated background scans of every CE/PE strike for this index and expiry. Only confirmed BUY setups trigger Telegram alerts. Scans are sequential and may take several minutes or encounter broker rate limits. No trades are placed.")
+            st.caption("Start Monitoring loads completed 5-minute candles once, then polls Angel One live FULL quotes in batches (default 10-second cycle; set STOCKTOOLS_POLL_SECONDS in .env). Retest alerts are intrabar; Entry alerts require the retest candle to close and a later price breakout. Quote polling is not a tick-by-tick WebSocket feed. No trades are placed.")
             scan_sides = st.selectbox("Option types to scan", ["CE + PE", "CE", "PE"], key="all_strike_sides")
             scan_lookback = st.selectbox("Historical candle lookback (trading days)", [1, 3, 5], index=1, key="all_strike_lookback")
             all_contracts = all_expiry_option_contracts(cache["master"], selected_index, expiry, scan_sides)
@@ -1082,6 +1406,9 @@ with tab_options:
                 monitor_errors = monitor_state()["last_errors"].copy()
                 monitor_context_saved = monitor_state()["context"]
                 monitor_alert_count = monitor_state()["last_alert_count"]
+                monitor_retest_count = monitor_state().get("last_retest_count", 0)
+                live_candidates = monitor_state().get("live_candidates", pd.DataFrame()).copy()
+                live_chart_data = dict(monitor_state().get("live_chart_data", {}))
 
             if monitor_running and st_autorefresh is not None:
                 st_autorefresh(interval=5000, key="stock_tools_monitor_refresh")
@@ -1093,10 +1420,23 @@ with tab_options:
                 st.caption(
                     f"Last scan: {monitor_last_scan} | "
                     f"Duration: {monitor_duration}s | "
-                    f"New BUY alerts in last scan: {monitor_alert_count}"
+                    f"Entry alerts this cycle: {monitor_alert_count} | Retest alerts this cycle: {monitor_retest_count}"
                 )
 
             if monitor_context_saved == monitor_context:
+                st.markdown("#### Live retest / breakout candidates")
+                if isinstance(live_candidates, pd.DataFrame) and not live_candidates.empty:
+                    st.dataframe(live_candidates, use_container_width=True, hide_index=True)
+                    chart_names = live_candidates["Contract"].dropna().astype(str).unique().tolist()
+                    live_chart_symbol = st.selectbox(
+                        "Live candidate chart", chart_names, key="live_candidate_chart_symbol"
+                    )
+                    live_chart = live_chart_data.get(live_chart_symbol)
+                    if isinstance(live_chart, pd.DataFrame) and not live_chart.empty:
+                        st.line_chart(live_chart[["Close", "EMA9", "EMA21"]], height=300)
+                else:
+                    st.info("No active retest or breakout candidates at the moment.")
+
                 results = monitor_results
                 if isinstance(results, pd.DataFrame) and not results.empty:
                     display_results = results.sort_values("Latest events", ascending=False).copy()
@@ -1434,7 +1774,9 @@ with tab_setup:
         "ANGEL_TOTP_SECRET=your_authenticator_base32_secret\n"
         "ANGEL_CLIENT_PUBLIC_IP=your_registered_static_public_ip\n"
         "TELEGRAM_BOT_TOKEN=your_telegram_bot_token\n"
-        "TELEGRAM_CHAT_ID=your_telegram_chat_id\n"
+        "TELEGRAM_RETEST_CHAT_ID=-5588683077\n"
+        "TELEGRAM_ENTRY_CHAT_ID=-5122452181\n"
+        "STOCKTOOLS_POLL_SECONDS=10\n"
         "# Optional if automatic local IP detection is wrong:\n"
         "ANGEL_CLIENT_LOCAL_IP=192.168.1.10",
         language="bash"
@@ -1461,7 +1803,7 @@ with tab_setup:
 st.divider()
 st.caption(
     "Educational paper-trading tool only. Index and every listed CE/PE strike for the selected expiry can be analysed independently. No order placement code exists in this file. "
-    "Market data may be delayed or unavailable. Greeks and quotes can change quickly. "
+    "Market data may be delayed or unavailable. Live quote polling is periodic, not tick-by-tick. Greeks and quotes can change quickly. "
     "Delta-based stop/target estimates are approximate; option premiums are affected by "
     "spread, volatility, theta, liquidity and gaps. Paper simulation does not guarantee "
     "real execution prices or future results. Verify expiry, strike and lot size with Angel One."
