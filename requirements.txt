@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+requests
+yfinance
+python-dotenv
+pyotp
+streamlit-autorefresh

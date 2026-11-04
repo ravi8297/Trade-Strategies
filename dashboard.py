@@ -67,10 +67,23 @@ ENTRY_START, ENTRY_END, SQUARE_OFF = 9 * 60 + 30, 14 * 60 + 30, 15 * 60 + 15
 MIN_RISK_ATR = 0.5
 MAX_RISK_PCT = 0.005
 
+# Underlying universe. Index tokens are Angel One spot-index tokens.
 INSTRUMENTS = {
-    "NIFTY": {"yf": "^NSEI", "step": 50, "index_token": "99926000"},
-    "BANKNIFTY": {"yf": "^NSEBANK", "step": 100, "index_token": "99926009"},
+    "NIFTY": {"yf": "^NSEI", "step": 50, "index_token": "99926000", "exchange": "NSE", "kind": "index"},
+    "BANKNIFTY": {"yf": "^NSEBANK", "step": 100, "index_token": "99926009", "exchange": "NSE", "kind": "index"},
+    "FINNIFTY": {"yf": "NIFTY_FIN_SERVICE.NS", "step": 50, "index_token": "99926037", "exchange": "NSE", "kind": "index"},
+    "MIDCPNIFTY": {"yf": "NIFTY_MID_SELECT.NS", "step": 25, "index_token": "99926074", "exchange": "NSE", "kind": "index"},
+    "SENSEX": {"yf": "^BSESN", "step": 100, "index_token": "99919000", "exchange": "BSE", "kind": "index"},
+    "BANKEX": {"yf": "BSE-BANK.BO", "step": 100, "index_token": "99919012", "exchange": "BSE", "kind": "index"},
 }
+STOCKS = ["RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY", "TCS"]
+CATEGORY_INSTRUMENTS = {
+    "NSE Indices": ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
+    "BSE Indices": ["SENSEX", "BANKEX"],
+    "Individual Stocks": STOCKS,
+    "Other F&O Stocks": [],
+}
+
 
 
 # ============================= GENERAL HELPERS =============================
@@ -118,6 +131,42 @@ def load_index_data(symbol: str, period: str = "60d") -> pd.DataFrame:
     else:
         data.index = data.index.tz_convert(TZ)
     return data
+
+
+def filter_regular_market_session(data: pd.DataFrame) -> pd.DataFrame:
+    """Keep only regular Indian equity-market candles: weekdays, 09:15–15:30 IST."""
+    if data is None or data.empty:
+        return data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
+    frame = data.copy()
+    idx = pd.DatetimeIndex(frame.index)
+    if idx.tz is None:
+        idx = idx.tz_localize(TZ)
+    else:
+        idx = idx.tz_convert(TZ)
+    frame.index = idx
+    minute_of_day = idx.hour * 60 + idx.minute
+    mask = (idx.dayofweek < 5) & (minute_of_day >= 9 * 60 + 15) & (minute_of_day < 15 * 60 + 30)
+    return frame.loc[mask].sort_index()
+
+
+def chart_with_session_gaps(data: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """Insert NaN rows between sessions so charts never draw overnight connector lines."""
+    if data is None or data.empty:
+        return pd.DataFrame(columns=columns)
+    frame = filter_regular_market_session(data[columns]).copy()
+    if frame.empty:
+        return frame
+    pieces = []
+    previous = None
+    for ts, row in frame.iterrows():
+        if previous is not None and (
+            ts.date() != previous.date() or (ts - previous) > pd.Timedelta(minutes=5)
+        ):
+            gap_ts = previous + pd.Timedelta(minutes=1)
+            pieces.append(pd.DataFrame([[np.nan] * len(columns)], index=[gap_ts], columns=columns))
+        pieces.append(row.to_frame().T)
+        previous = ts
+    return pd.concat(pieces).sort_index()
 
 
 def prepare_index_data(data: pd.DataFrame) -> pd.DataFrame:
@@ -307,12 +356,13 @@ class AngelOneReadOnly:
             )
         return payload.get("data")
 
-    def historical_candles(self, token: str, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
-        """Fetch read-only 5-minute NFO candles for one option contract."""
+    def historical_candles(self, token: str, from_dt: datetime, to_dt: datetime,
+                           exchange: str = "NFO") -> pd.DataFrame:
+        """Fetch read-only 5-minute candles for an Angel One exchange/token."""
         data = self.post(
             "/rest/secure/angelbroking/historical/v1/getCandleData",
             {
-                "exchange": "NFO", "symboltoken": str(token),
+                "exchange": exchange, "symboltoken": str(token),
                 "interval": "FIVE_MINUTE",
                 "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
                 "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
@@ -329,7 +379,8 @@ class AngelOneReadOnly:
         frame = frame.dropna(subset=["Datetime"]).set_index("Datetime").sort_index()
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
-        return frame.dropna(subset=["Open", "High", "Low", "Close"])
+        frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+        return filter_regular_market_session(frame)
 
     def option_greeks(self, underlying: str, expiry: date) -> pd.DataFrame:
         expiry_text = expiry.strftime("%d%b%Y").upper()
@@ -348,14 +399,14 @@ class AngelOneReadOnly:
             frame["strike"] = frame["strikePrice"]
         return frame
 
-    def full_quotes(self, token_list: list) -> pd.DataFrame:
+    def full_quotes(self, token_list: list, exchange: str = "NFO") -> pd.DataFrame:
         # SmartAPI quote endpoint accepts up to 50 tokens per request.
         rows = []
         for start in range(0, len(token_list), 50):
             tokens = token_list[start:start + 50]
             data = self.post(
                 "/rest/secure/angelbroking/market/v1/quote/",
-                {"mode": "FULL", "exchangeTokens": {"NFO": tokens}}
+                {"mode": "FULL", "exchangeTokens": {exchange: tokens}}
             )
             rows.extend((data or {}).get("fetched", []))
         return pd.DataFrame(rows)
@@ -402,18 +453,30 @@ def get_option_contracts(master: pd.DataFrame, index_name: str,
     return df
 
 
-def all_expiry_option_contracts(master: pd.DataFrame, index_name: str, expiry: date,
-                                sides: str = "CE + PE") -> pd.DataFrame:
-    """All listed strikes for the chosen underlying and expiry; no ATM or Greek filter."""
+def all_expiry_option_contracts(master: pd.DataFrame, underlying: str, expiry: date,
+                                sides: str = "CE + PE", category: str = "") -> pd.DataFrame:
+    """All listed option strikes for an index or eligible stock and expiry."""
+    kind = "OPTIDX" if underlying in INSTRUMENTS else "OPTSTK"
     df = master.loc[
         (master["exch_seg"] == "NFO") &
-        (master["instrumenttype"] == "OPTIDX") &
-        (master["name"] == index_name) &
+        (master["instrumenttype"] == kind) &
+        (master["name"].astype(str).str.upper() == underlying.upper()) &
         (master["expiry_date"] == expiry)
     ].copy()
     suffixes = ("CE", "PE") if sides == "CE + PE" else (sides,)
     df = df[df["symbol"].astype(str).str.endswith(suffixes)]
     return df.drop_duplicates(subset=["token"]).sort_values(["strike", "symbol"])
+
+
+def cash_equity_contract(master: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Resolve a listed NSE cash-equity symbol from Angel One's instrument master."""
+    candidates = master[
+        (master["exch_seg"] == "NSE") &
+        (master["symbol"].astype(str).str.upper() == f"{symbol.upper()}-EQ")
+    ].copy()
+    if candidates.empty:
+        raise RuntimeError(f"{symbol}-EQ was not found in Angel One's NSE instrument master.")
+    return candidates.head(1)
 
 
 def scan_every_strike(client, contracts, lookback_days, rr, pause_seconds=0.45):
@@ -567,7 +630,9 @@ def analyze_option_candles(raw: pd.DataFrame, rr: float = 2.0):
     """Return enriched option candles, automatic levels and chronological setup events."""
     if raw is None or len(raw) < 25:
         raise ValueError("At least 25 completed 5-minute option candles are required.")
-    df = raw.copy()
+    df = filter_regular_market_session(raw)
+    if len(df) < 25:
+        raise ValueError("Fewer than 25 regular-session 5-minute candles are available.")
     df["EMA9"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["EMA21"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
     prev_close = df["Close"].shift(1)
@@ -673,31 +738,27 @@ def format_retest_alert(contract: str, ltp: float, ema9: float, ema21: float,
     else:
         stamp = stamp.tz_convert(TZ)
     return (
-        "STOCK TOOLS - RETEST ALERT\n\n"
-        f"{contract}\n"
-        f"Retest candle is forming ({stamp:%H:%M}–{(stamp + pd.Timedelta(minutes=5)):%H:%M} IST)\n\n"
-        f"Current price : ₹{ltp:.2f}\n"
-        f"EMA 9         : ₹{ema9:.2f}\n"
-        f"EMA 21        : ₹{ema21:.2f}\n"
-        f"Current candle High: ₹{candle_high:.2f}\n"
-        f"Current candle Low : ₹{candle_low:.2f}\n\n"
-        f"Wait for this 5-minute candle to close. Watch breakout above its FINAL High.\n"
-        "NOT A BUY SIGNAL. If price breaks EMA 21 before candle close, this retest is cancelled."
+        f"[WAIT FOR CLOSE] {contract}\n"
+        f"[RETEST] Price touched EMA 9 at ₹{ltp:.2f}\n"
+        f"[CHECK] EMA 9: ₹{ema9:.2f} | EMA 21: ₹{ema21:.2f}\n"
+        f"[WATCH] Current candle High: ₹{candle_high:.2f} | Low: ₹{candle_low:.2f}\n"
+        f"[TIME] 5-minute candle: {stamp:%H:%M}–{(stamp + pd.Timedelta(minutes=5)):%H:%M} IST\n\n"
+        f"[NEXT ACTION] Wait for this candle to close. Then watch for a break above its final High.\n"
+        "[NO BUY] This is not an entry signal. If price falls to/below EMA 21 before close, the retest is cancelled."
     )
 
 
 def format_entry_alert(contract: str, entry: float, stop: float, target: float,
                        rr: float, live_price: float) -> str:
     return (
-        "STOCK TOOLS - ENTRY ALERT\n\n"
-        f"{contract}\n\n"
-        f"Price broke above retest candle High: ₹{entry:.2f}\n"
-        f"Current live price: ₹{live_price:.2f}\n\n"
-        f"BUY       : ₹{entry:.2f} (breakout reference)\n"
-        f"STOP-LOSS : ₹{stop:.2f} (Retest candle Low)\n"
-        f"TARGET    : ₹{target:.2f} (1:{rr:g} Risk-Reward)\n\n"
-        "Potential entry opportunity. Check live price/slippage and review chart before entering.\n"
-        "Paper alert only. No broker order placed."
+        f"[ENTRY BREAKOUT] {contract}\n"
+        f"[TRIGGER] Price broke above retest High: ₹{entry:.2f}\n"
+        f"[LIVE PRICE] ₹{live_price:.2f}\n\n"
+        f"[BUY LEVEL] ₹{entry:.2f} (breakout reference)\n"
+        f"[STOP-LOSS] ₹{stop:.2f} (retest candle Low)\n"
+        f"[TARGET] ₹{target:.2f} (1:{rr:g} risk-reward)\n\n"
+        "[NEXT ACTION] Check the live price and chart before taking any action.\n"
+        "[PAPER ONLY] No broker order was placed."
     )
 
 
@@ -743,17 +804,14 @@ def format_buy_alert(event, label):
         stamp = stamp.tz_localize(TZ)
     else:
         stamp = stamp.tz_convert(TZ)
-
     return (
-        f"BUY ALERT\n\n"
-        f"{label}\n"
-        f"Time: {stamp.strftime('%Y-%m-%d %H:%M')} IST\n\n"
-        f"Buy : ₹{float(event['price']):.2f}\n"
-        f"SL  : ₹{float(event['stop']):.2f}\n"
-        f"Sell: ₹{float(event['target']):.2f}\n\n"
-        f"Why buying: EMA Retest Breakout\n\n"
-        f"5-minute strategy\n"
-        f"No broker order placed."
+        f"[PAPER ENTRY SETUP] {label}\n"
+        f"[TIME] {stamp.strftime('%Y-%m-%d %H:%M')} IST\n"
+        f"[BUY LEVEL] ₹{float(event['price']):.2f}\n"
+        f"[STOP-LOSS] ₹{float(event['stop']):.2f}\n"
+        f"[TARGET] ₹{float(event['target']):.2f}\n\n"
+        "[NEXT ACTION] Review the chart and live price.\n"
+        "[PAPER ONLY] No broker order was placed."
     )
 
 
@@ -790,7 +848,7 @@ def get_monitor_manager():
             "running": False,
             "stop_event": None,
             "thread": None,
-            "status": "Stopped",
+            "status": "[STOPPED] Monitoring is off.",
             "last_scan": None,
             "last_scan_duration": None,
             "last_results": pd.DataFrame(),
@@ -824,7 +882,7 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
     errors = []
     total = len(contracts)
     with monitor_lock():
-        monitor_state()["status"] = f"Loading candle history for {total} contracts..."
+        monitor_state()["status"] = f"[LOADING] Preparing candle history for {total} contracts."
 
     end_dt = datetime.now(pd.Timestamp.now(tz=TZ).tzinfo)
     start_dt = end_dt - timedelta(days=lookback_days * 2 + 3)
@@ -877,7 +935,7 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
     if stop_event.is_set():
         with monitor_lock():
             monitor_state()["running"] = False
-            monitor_state()["status"] = "Stopped"
+            monitor_state()["status"] = "[STOPPED] Monitoring is off."
         return
 
     active_contracts = contracts[contracts["token"].astype(str).isin(baselines)].copy()
@@ -1004,9 +1062,9 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
                     if ltp <= ema21:
                         state["state"] = "CANCELLED_EMA21_BREAK"
                         cancel_text = (
-                            f"STOCK TOOLS - RETEST CANCELLED\n\n{state['symbol']}\n"
-                            f"Price fell to/below EMA 21 (₹{ema21:.2f}) before candle close.\n"
-                            "No entry alert will be generated for this retest."
+                            f"[RETEST CANCELLED] {state['symbol']}\n"
+                            f"[REASON] Price fell to/below EMA 21 (₹{ema21:.2f}) before candle close.\n"
+                            "[NEXT ACTION] Skip this setup. No entry alert will follow."
                         )
                         if state.get("retest_message_id"):
                             send_retest_telegram(cancel_text, state["retest_message_id"])
@@ -1058,13 +1116,11 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
                     state["state"] = "WAITING_FOR_BREAKOUT"
                     if state.get("retest_message_id"):
                         closed_text = (
-                            "STOCK TOOLS - RETEST CANDLE CLOSED\n\n"
-                            f"{state['symbol']}\n"
-                            f"Final retest candle High: ₹{float(state['retest_high']):.2f}\n"
-                            f"Final retest candle Low : ₹{float(state['retest_low']):.2f}\n\n"
-                            f"Watch breakout above ₹{float(state['retest_high']):.2f}.\n"
-                            "Entry alert will be sent only if a later live quote breaks this High.\n"
-                            "This is not a buy signal yet."
+                            f"[RETEST CANDLE CLOSED] {state['symbol']}\n"
+                            f"[FINAL HIGH] ₹{float(state['retest_high']):.2f}\n"
+                            f"[FINAL LOW] ₹{float(state['retest_low']):.2f}\n\n"
+                            f"[NEXT ACTION] Watch for a later price break above ₹{float(state['retest_high']):.2f}.\n"
+                            "[NO BUY] Wait for the breakout alert."
                         )
                         ok, detail, updated_id = send_retest_telegram(
                             closed_text, state["retest_message_id"]
@@ -1109,9 +1165,9 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
                     "last_retest_count": retest_alerts,
                     "context": context,
                     "status": (
-                        f"Live polling active | {len(quote_map)}/{len(tokens)} quotes | "
-                        f"{retest_alerts} retest alert(s), {entry_alerts} entry alert(s) "
-                        f"this cycle | {duration}s"
+                        f"[MONITORING] Live prices checked: {len(quote_map)}/{len(tokens)} | "
+                        f"[RETEST ALERTS] {retest_alerts} | [ENTRY ALERTS] {entry_alerts} "
+                        f"[CYCLE TIME] {duration}s"
                     ),
                 })
                 if quote_errors:
@@ -1123,13 +1179,13 @@ def _monitor_worker(client, contracts, lookback_days, rr, context, stop_event):
         except Exception as exc:
             with monitor_lock():
                 monitor_state()["status"] = (
-                    f"Live quote error: {exc}. Retrying in {poll_seconds} seconds."
+                    f"[QUOTE ERROR] {exc}. [NEXT ACTION] Retry in {poll_seconds} seconds."
                 )
         stop_event.wait(max(1, poll_seconds - (time.time() - cycle_started)))
 
     with monitor_lock():
         monitor_state()["running"] = False
-        monitor_state()["status"] = "Stopped"
+        monitor_state()["status"] = "[STOPPED] Monitoring is off."
 
 def start_background_monitor(client, contracts, lookback_days, rr, context):
     with monitor_lock():
@@ -1147,7 +1203,7 @@ def start_background_monitor(client, contracts, lookback_days, rr, context):
             "running": True,
             "stop_event": stop_event,
             "thread": worker,
-            "status": "Starting monitor...",
+            "status": "[STARTING] Preparing option monitoring.",
             "context": context,
             "last_alert_count": 0,
         })
@@ -1160,7 +1216,7 @@ def stop_background_monitor():
         stop_event = monitor_state().get("stop_event")
         if stop_event is not None:
             stop_event.set()
-        monitor_state()["status"] = "Stopping after the current API request..."
+        monitor_state()["status"] = "[STOPPING] Finishing the current API request."
 
 
 # ============================= PAPER TRADING =============================
@@ -1198,24 +1254,63 @@ def update_paper_trade_prices(client: AngelOneReadOnly):
             trade["Status"] = "STOP HIT (paper)"
             trade["Exit Premium"] = trade["Stop Premium"]
             trade["Realized P/L"] = ((trade["Exit Premium"] - trade["Entry Premium"]) * trade["Quantity"])
-            send_telegram_alert(f"PAPER EXIT ALERT | {trade['Contract']}\nSTOP HIT\nExit premium: ₹{trade['Exit Premium']:.2f}\nPaper P/L: ₹{trade['Realized P/L']:.2f}\nNo broker order placed.")
+            send_telegram_alert(f"[STOP-LOSS HIT] {trade['Contract']}\n[EXIT PRICE] ₹{trade['Exit Premium']:.2f}\n[PAPER P/L] ₹{trade['Realized P/L']:.2f}\n[NEXT ACTION] Review the paper trade. No broker order was placed.")
         elif ltp >= trade["Target Premium"]:
             trade["Status"] = "TARGET HIT (paper)"
             trade["Exit Premium"] = trade["Target Premium"]
             trade["Realized P/L"] = ((trade["Exit Premium"] - trade["Entry Premium"]) * trade["Quantity"])
-            send_telegram_alert(f"PAPER EXIT ALERT | {trade['Contract']}\nTARGET HIT\nExit premium: ₹{trade['Exit Premium']:.2f}\nPaper P/L: ₹{trade['Realized P/L']:.2f}\nNo broker order placed.")
+            send_telegram_alert(f"[TARGET HIT] {trade['Contract']}\n[EXIT PRICE] ₹{trade['Exit Premium']:.2f}\n[PAPER P/L] ₹{trade['Realized P/L']:.2f}\n[NEXT ACTION] Review the paper trade. No broker order was placed.")
 
 
 # ============================= UI =============================
 
 init_state()
 
-st.title("📈 Stock Tools – Angel One Option Selector")
-st.caption("NIFTY / BANKNIFTY • EMA 9/21 • Angel One market data • PAPER TRADING ONLY")
+st.title("📈 Stock Tools – Multi-Underlying EMA 9/21 Scanner")
+st.caption("NSE & BSE indices • F&O stocks • NSE cash equities • EMA 9/21 • PAPER TRADING ONLY")
 
 with st.sidebar:
     st.header("Strategy & risk settings")
-    indices = st.multiselect("Indices", list(INSTRUMENTS), default=["NIFTY", "BANKNIFTY"])
+    category = st.selectbox(
+        "CATEGORY",
+        ["NSE Indices", "BSE Indices", "Individual Stocks", "Other F&O Stocks"],
+        key="scanner_category",
+    )
+    if category == "Other F&O Stocks":
+        try:
+            _master_for_choices = download_instrument_master()
+            _eligible = sorted(_master_for_choices.loc[
+                (_master_for_choices["exch_seg"] == "NFO") &
+                (_master_for_choices["instrumenttype"] == "OPTSTK"),
+                "name"
+            ].dropna().astype(str).str.upper().unique().tolist())
+        except Exception:
+            _eligible = []
+        instrument_choices = _eligible
+        if not instrument_choices:
+            st.warning("Connect to the internet to load the eligible F&O stock list from Angel One's instrument master.")
+    else:
+        instrument_choices = CATEGORY_INSTRUMENTS[category]
+    default_instrument = "NIFTY" if category == "NSE Indices" else (
+        "SENSEX" if category == "BSE Indices" else (
+            "RELIANCE" if category == "Individual Stocks" else
+            (instrument_choices[0] if instrument_choices else "")
+        )
+    )
+    selected_instruments = st.multiselect(
+        "INSTRUMENTS", instrument_choices,
+        default=[default_instrument] if default_instrument in instrument_choices else [],
+        key="scanner_instruments",
+    )
+    scan_type = st.radio(
+        "SCAN TYPE", ["Options (CE + PE)", "Equity (Cash)"],
+        horizontal=True, key="scanner_scan_type",
+        disabled=category in ("NSE Indices", "BSE Indices"),
+    )
+    if category in ("NSE Indices", "BSE Indices"):
+        scan_type = "Options (CE + PE)"
+    indices = selected_instruments
+    st.caption("Selected: " + (", ".join(selected_instruments) if selected_instruments else "No instrument") + " · " + scan_type)
     capital = st.number_input("Paper capital (₹)", min_value=1000, value=50000, step=5000)
     risk_percent = st.number_input("Risk budget per paper trade (%)",
                                    min_value=0.1, max_value=2.0,
@@ -1242,6 +1337,8 @@ with tab_market:
         load_index_data.clear()
 
     for name in indices:
+        if name not in INSTRUMENTS:
+            continue
         try:
             raw = load_index_data(INSTRUMENTS[name]["yf"], period)
             df = prepare_index_data(raw)
@@ -1268,7 +1365,7 @@ with tab_market:
             c3.metric("EMA 21", f"{last['EMA21']:,.2f}")
             c4.metric("Trend", "Bullish" if last["EMA9"] > last["EMA21"] else "Bearish")
             st.caption(f"Last completed candle: {df.index[-1]:%d %b %Y %H:%M} IST")
-            st.line_chart(df[["Close", "EMA9", "EMA21"]].tail(150), height=260)
+            st.line_chart(chart_with_session_gaps(df.tail(150), ["Close", "EMA9", "EMA21"]), height=260)
             if sigs:
                 sig = sigs[-1]
                 st.success(
@@ -1303,12 +1400,12 @@ with tab_options:
         if st.button("Connect / refresh Angel One session", key="angel_connect"):
             try:
                 api.login()
-                st.success("Angel One read-only session connected.")
+                st.success("[CONNECTED] Angel One market data is ready. [PAPER ONLY] No orders can be placed.")
             except Exception as exc:
                 st.error(f"Angel One connection failed: {exc}")
 
     if ready and indices:
-        selected_index = st.selectbox("Choose index for option selection", indices)
+        selected_index = st.selectbox("Choose underlying", indices, key="chain_underlying")
         use_latest_signal = st.checkbox("Use latest EMA BUY signal as underlying reference", value=True)
         df_for_index = market_frames.get(selected_index)
         sig_for_index = (market_signals.get(selected_index) or [None])[-1]
@@ -1332,14 +1429,12 @@ with tab_options:
                 if not api.jwt:
                     api.login()
                 master = download_instrument_master()
-                available = get_option_contracts(
-                    master, selected_index, date.today(), spot
-                )
+                option_kind = "OPTIDX" if selected_index in INSTRUMENTS else "OPTSTK"
                 all_expiries = sorted(
                     master[
                         (master["exch_seg"] == "NFO")
-                        & (master["instrumenttype"] == "OPTIDX")
-                        & (master["name"] == selected_index)
+                        & (master["instrumenttype"] == option_kind)
+                        & (master["name"].astype(str).str.upper() == selected_index.upper())
                         & (master["expiry_date"] >= date.today())
                     ]["expiry_date"].dropna().unique().tolist()
                 )
@@ -1364,7 +1459,7 @@ with tab_options:
                 format_func=lambda d: d.strftime("%d %b %Y")
             )
             st.markdown("#### Scan ALL listed option strikes (independent of selection)")
-            st.caption("Start Monitoring loads completed 5-minute candles once, then polls Angel One live FULL quotes in batches (default 10-second cycle; set STOCKTOOLS_POLL_SECONDS in .env). Retest alerts are intrabar; Entry alerts require the retest candle to close and a later price breakout. Quote polling is not a tick-by-tick WebSocket feed. No trades are placed.")
+            st.caption("[HOW IT WORKS] Load completed 5-minute candles once. Then check live prices at the interval in STOCKTOOLS_POLL_SECONDS. [RETEST] Alert when price touches EMA 9. [ENTRY] Alert only after the retest candle closes and price breaks its High. [LIMIT] Polling is not tick-by-tick. [PAPER ONLY] No broker orders are placed.")
             scan_sides = st.selectbox("Option types to scan", ["CE + PE", "CE", "PE"], key="all_strike_sides")
             scan_lookback = st.selectbox("Historical candle lookback (trading days)", [1, 3, 5], index=1, key="all_strike_lookback")
             all_contracts = all_expiry_option_contracts(cache["master"], selected_index, expiry, scan_sides)
@@ -1385,16 +1480,16 @@ with tab_options:
                             api, all_contracts, scan_lookback, rr, monitor_context
                         )
                         if started:
-                            st.success("Monitoring started. The first full scan is running in the background.")
+                            st.success("[STARTED] Monitoring is running. [NEXT ACTION] Watch the live candidates below.")
                         else:
-                            st.info("A monitor is already running. Stop it before starting another.")
+                            st.info("[ALREADY RUNNING] Keep the current monitor, or stop it before starting another.")
                     except Exception as exc:
                         st.error(f"Could not start monitoring: {exc}")
 
             with monitor_col2:
                 if st.button("■ Stop Monitoring", key="stop_all_strike_monitor"):
                     stop_background_monitor()
-                    st.info("Stop requested. The current scan will finish its current request, then stop.")
+                    st.info("[STOP REQUESTED] The monitor will stop after its current API request.")
 
             with monitor_lock():
                 monitor_running = monitor_state()["running"]
@@ -1413,9 +1508,9 @@ with tab_options:
             if monitor_running and st_autorefresh is not None:
                 st_autorefresh(interval=5000, key="stock_tools_monitor_refresh")
             elif monitor_running and st_autorefresh is None:
-                st.info("Background alerts are active. Install streamlit-autorefresh to refresh this status automatically.")
+                st.info("[MONITORING] Alerts are active. [ACTION] Install streamlit-autorefresh to refresh this dashboard automatically.")
 
-            st.info(f"**Monitor status:** {monitor_status}")
+            st.info(f"**[STATUS]** {monitor_status}")
             if monitor_last_scan:
                 st.caption(
                     f"Last scan: {monitor_last_scan} | "
@@ -1424,7 +1519,7 @@ with tab_options:
                 )
 
             if monitor_context_saved == monitor_context:
-                st.markdown("#### Live retest / breakout candidates")
+                st.markdown("#### [WATCH] Live retest / breakout candidates")
                 if isinstance(live_candidates, pd.DataFrame) and not live_candidates.empty:
                     st.dataframe(live_candidates, use_container_width=True, hide_index=True)
                     chart_names = live_candidates["Contract"].dropna().astype(str).unique().tolist()
@@ -1433,9 +1528,9 @@ with tab_options:
                     )
                     live_chart = live_chart_data.get(live_chart_symbol)
                     if isinstance(live_chart, pd.DataFrame) and not live_chart.empty:
-                        st.line_chart(live_chart[["Close", "EMA9", "EMA21"]], height=300)
+                        st.line_chart(chart_with_session_gaps(live_chart, ["Close", "EMA9", "EMA21"]), height=300)
                 else:
-                    st.info("No active retest or breakout candidates at the moment.")
+                    st.info("[WAIT] No active retest or breakout setup. Keep monitoring.")
 
                 results = monitor_results
                 if isinstance(results, pd.DataFrame) and not results.empty:
@@ -1515,7 +1610,7 @@ with tab_options:
                     saved_symbol = st.session_state.get("monitor_strategy_chart_symbol")
                     if isinstance(saved_chart, pd.DataFrame) and not saved_chart.empty and saved_symbol == chart_symbol:
                         st.line_chart(
-                            saved_chart[["Close", "EMA9", "EMA21", "Support", "Resistance"]].tail(120),
+                            chart_with_session_gaps(saved_chart.tail(120), ["Close", "EMA9", "EMA21", "Support", "Resistance"]),
                             height=360
                         )
                         st.caption("How to read: price above EMA 9 and EMA 21 is stronger; EMA 9 above EMA 21 means bullish trend. Support and resistance are calculated from recent candles. These are estimates, not guarantees.")
@@ -1575,22 +1670,27 @@ with tab_options:
                 }),
                 use_container_width=True, hide_index=True
             )
-            eligible = comparison[comparison["qualifies"] & comparison["ltp"].notna()].copy()
-            if eligible.empty:
-                st.warning(
-                    "No contract passed all selected filters. Do not force a trade. "
-                    "Relax filters only after reviewing liquidity and spreads."
-                )
+            paper_candidates = comparison[
+                comparison["ltp"].notna() & (pd.to_numeric(comparison["ltp"], errors="coerce") > 0)
+            ].copy()
+            if paper_candidates.empty:
+                st.warning("Angel One did not return a valid LTP for these contracts. Refresh the option comparison.")
             else:
-                eligible["display"] = eligible.apply(
+                paper_candidates["display"] = paper_candidates.apply(
                     lambda r: f"{r['symbol']} | LTP ₹{r['ltp']:.2f} | "
-                              f"Delta {r['delta']:.2f} | Spread "
-                              f"{r['spread_pct']:.2f}%",
+                              f"Delta {r['delta']:.2f}" if pd.notna(r.get("delta")) else
+                              f"{r['symbol']} | LTP ₹{r['ltp']:.2f} | Delta unavailable",
                     axis=1
                 )
-                chosen_label = st.selectbox("Select a qualifying contract to paper trade",
-                                            eligible["display"].tolist())
-                chosen = eligible[eligible["display"] == chosen_label].iloc[0]
+                chosen_label = st.selectbox("Select a contract to paper trade",
+                                            paper_candidates["display"].tolist(),
+                                            key="paper_contract_select")
+                chosen = paper_candidates[paper_candidates["display"] == chosen_label].iloc[0]
+                if not bool(chosen.get("qualifies", False)):
+                    st.warning("This contract does not pass all Delta/liquidity/spread filters. Review the metrics carefully before paper trading.")
+                    allow_override = st.checkbox("I understand the filters failed and want to paper-trade this contract anyway.", key="paper_filter_override")
+                else:
+                    allow_override = True
                 st.markdown("#### Selected option chart analysis (5-minute candles)")
                 st.caption("This independently analyses the selected CE contract. Index signals remain separate; option signals are not blocked by the index crossover state.")
                 scan_days = st.selectbox("Option candle lookback", [1, 3, 5], index=2, format_func=lambda x: f"{x} trading-day(s)")
@@ -1612,7 +1712,7 @@ with tab_options:
                         st.error(f"Option candle scan failed: {exc}")
                 option_chart=st.session_state.option_cache.get("option_candles")
                 if isinstance(option_chart,pd.DataFrame) and not option_chart.empty and st.session_state.option_cache.get("option_contract_label")==str(chosen["symbol"]):
-                    st.line_chart(option_chart[["Close","EMA9","EMA21"]].tail(150),height=280)
+                    st.line_chart(chart_with_session_gaps(option_chart.tail(150), ["Close", "EMA9", "EMA21"]), height=280)
                     last_opt=option_chart.iloc[-1]
                     m1,m2,m3,m4=st.columns(4)
                     m1.metric("Option LTP / close",money(last_opt["Close"]))
@@ -1631,7 +1731,7 @@ with tab_options:
                     min_value=0.05, value=float(chosen["ltp"]), step=0.05
                 )
                 lot_size = int(chosen["lotsize"])
-                delta_value = abs(float(chosen["delta"]))
+                delta_value = abs(float(chosen["delta"])) if pd.notna(chosen.get("delta")) else 0.50
                 if cache.get("index_stop") is not None and cache.get("index_target") is not None:
                     idx_risk = cache["spot"] - cache["index_stop"]
                     idx_reward = cache["index_target"] - cache["spot"]
@@ -1676,7 +1776,9 @@ with tab_options:
                         max_value=affordable_lots, value=1, step=1
                     )
                     quantity = int(lots_to_simulate) * lot_size
-                    if st.button("▶ Start PAPER trade (no broker order)", type="primary"):
+                    if st.button("▶ Start PAPER trade (no broker order)", type="primary",
+                                 disabled=not allow_override,
+                                 key="start_selected_paper_trade"):
                         paper = {
                             "Created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "Index": selected_index,
@@ -1695,11 +1797,62 @@ with tab_options:
                             "Status": "OPEN",
                         }
                         st.session_state.paper_trades.append(paper)
-                        st.success("Paper trade added. No order was sent to Angel One.")
+                        st.success("[PAPER TRADE ADDED] Open the Paper Trades tab to view and manage this simulated position. No broker order was sent.")
+                        st.info("If the Paper Trades tab does not update immediately, click once anywhere in the dashboard or refresh the page.")
+
+
+# ============================= CASH EQUITY SCANNER =============================
+if scan_type == "Equity (Cash)" and selected_instruments:
+    st.markdown("---")
+    st.subheader("NSE Equity Cash — EMA 9/21 scanner")
+    st.caption("Read-only NSE cash candles. Paper signals only; no broker orders are placed.")
+    cash_symbol = st.selectbox("Cash stock", selected_instruments, key="cash_equity_symbol")
+    cash_lookback = st.selectbox("Cash candle lookback (days)", [5, 15, 30, 60], index=2, key="cash_lookback")
+    if st.button("Scan cash equity", key="scan_cash_equity"):
+        try:
+            cash_api = st.session_state.angel_client
+            if not cash_api:
+                raise RuntimeError("Configure and connect Angel One first.")
+            if not cash_api.jwt:
+                cash_api.login()
+            master_cash = download_instrument_master()
+            cash_contract = cash_equity_contract(master_cash, cash_symbol).iloc[0]
+            cash_end = datetime.now(pd.Timestamp.now(tz=TZ).tzinfo)
+            cash_start = cash_end - timedelta(days=cash_lookback * 2 + 3)
+            cash_df = cash_api.historical_candles(
+                str(cash_contract["token"]), cash_start, cash_end, exchange="NSE"
+            )
+            if not cash_df.empty:
+                cash_df = cash_df.loc[cash_df.index + pd.Timedelta(minutes=5) <= pd.Timestamp.now(tz=TZ)]
+            if len(cash_df) < 25:
+                st.warning(f"Only {len(cash_df)} completed candles returned; at least 25 are required.")
+            else:
+                cash_df["EMA9"] = cash_df["Close"].ewm(span=9, adjust=False).mean()
+                cash_df["EMA21"] = cash_df["Close"].ewm(span=21, adjust=False).mean()
+                cash_df["Trend"] = np.where(cash_df["EMA9"] > cash_df["EMA21"], "Bullish", "Bearish")
+                previous, latest = cash_df.iloc[-2], cash_df.iloc[-1]
+                crossed_up = previous["EMA9"] <= previous["EMA21"] and latest["EMA9"] > latest["EMA21"]
+                retest = latest["Low"] <= latest["EMA9"] and latest["Close"] > latest["EMA21"]
+                breakout = latest["Close"] > cash_df["High"].iloc[-2]
+                st.metric("Latest cash price", money(latest["Close"]))
+                st.write(f"**Trend:** {latest['Trend']} | **EMA 9:** {latest['EMA9']:.2f} | **EMA 21:** {latest['EMA21']:.2f}")
+                if crossed_up:
+                    st.success("Bullish EMA 9/21 crossover detected on the latest completed candle.")
+                elif retest and breakout:
+                    st.success("Potential EMA 9/21 retest + prior-candle breakout condition detected.")
+                elif retest:
+                    st.info("EMA 9 retest condition detected; waiting for a later breakout.")
+                else:
+                    st.info("No completed-candle EMA 9/21 retest-breakout setup on the latest candle.")
+                st.line_chart(chart_with_session_gaps(cash_df, ["Close", "EMA9", "EMA21"]), height=320)
+                st.dataframe(cash_df.tail(15), use_container_width=True)
+        except Exception as exc:
+            st.error(f"Cash equity scan failed: {exc}")
 
 with tab_paper:
     st.subheader("Paper trade ledger")
-    st.caption("Simulated trades only. No real positions or orders are created.")
+    st.caption("Simulated trades only. No real positions or orders are created. A trade appears here immediately after Start PAPER is clicked in the Option Selector.")
+    st.metric("Saved paper trades", len(st.session_state.paper_trades))
     if st.button("Refresh paper trade LTP / check stop & target", key="refresh_paper"):
         client = st.session_state.angel_client
         if client and client.credentials_ready():
@@ -1746,8 +1899,8 @@ with tab_paper:
                     (manual_exit - trade["Entry Premium"]) * trade["Quantity"]
                 )
                 trade["Status"] = "CLOSED (manual paper)"
-                send_telegram_alert(f"PAPER EXIT ALERT | {trade['Contract']}\nMANUAL PAPER EXIT\nExit premium: ₹{manual_exit:.2f}\nPaper P/L: ₹{trade['Realized P/L']:.2f}\nNo broker order placed.")
-                st.success("Paper trade closed. No broker order was sent.")
+                send_telegram_alert(f"[MANUAL PAPER EXIT] {trade['Contract']}\n[EXIT PRICE] ₹{manual_exit:.2f}\n[PAPER P/L] ₹{trade['Realized P/L']:.2f}\n[NEXT ACTION] Review the closed paper trade. No broker order was placed.")
+                st.success("[PAPER TRADE CLOSED] Review the final P/L. No broker order was sent.")
         csv_data = pdf.to_csv(index=False).encode("utf-8")
         st.download_button("Download paper ledger CSV", csv_data,
                            "angel_one_paper_trades.csv", "text/csv")
@@ -1786,6 +1939,22 @@ with tab_setup:
         "GitHub or screenshots. Keep .env in .gitignore. Confirm SmartAPI activation, "
         "IP requirements and current API policies directly with Angel One."
     )
+    st.markdown("#### [TEST] Telegram delivery")
+    st.caption("Send one test message to each configured group. These are test messages only.")
+    test_col1, test_col2 = st.columns(2)
+    with test_col1:
+        if st.button("[TEST] Retest group", key="test_retest_telegram"):
+            ok, detail, _ = send_retest_telegram(
+                "[TEST MESSAGE] Retest group is connected.\n[NEXT ACTION] No action required."
+            )
+            (st.success if ok else st.error)("[SENT] Retest group test message." if ok else f"[FAILED] {detail}")
+    with test_col2:
+        if st.button("[TEST] Entry group", key="test_entry_telegram"):
+            ok, detail = send_entry_telegram(
+                "[TEST MESSAGE] Entry group is connected.\n[NEXT ACTION] No action required.\n[PAPER ONLY] No broker order was placed."
+            )
+            (st.success if ok else st.error)("[SENT] Entry group test message." if ok else f"[FAILED] {detail}")
+
     st.write("Local IP detected:", local_ip())
     st.write("MAC address detected:", mac_address())
     st.write("Public IP configured:", "Yes" if os.getenv("ANGEL_CLIENT_PUBLIC_IP") else "No")
@@ -1794,7 +1963,7 @@ with tab_setup:
             client = AngelOneReadOnly()
             client.login()
             st.session_state.angel_client = client
-            st.success("Angel One session connected. This app has no order functions.")
+            st.success("[CONNECTED] Angel One market data is ready. [PAPER ONLY] No order functions are available.")
         except Exception as exc:
             st.error(f"Connection failed: {exc}")
     if st.session_state.angel_client and st.session_state.angel_client.jwt:
