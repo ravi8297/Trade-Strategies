@@ -1313,7 +1313,7 @@ with st.sidebar:
     st.caption("Selected: " + (", ".join(selected_instruments) if selected_instruments else "No instrument") + " · " + scan_type)
     capital = st.number_input("Paper capital (₹)", min_value=1000, value=50000, step=5000)
     risk_percent = st.number_input("Risk budget per paper trade (%)",
-                                   min_value=0.1, max_value=2.0,
+                                   min_value=0.1, max_value=9.0,
                                    value=1.0, step=0.1)
     risk_budget = capital * risk_percent / 100
     st.metric("Maximum risk budget", money(risk_budget))
